@@ -604,7 +604,7 @@ class PlanRequest(BaseModel):
 async def get_homepage():
     return HTMLResponse(content=INDEX_HTML)
 
-@app.get("/health")
+@app.head("/health")
 async def health_check():
     return {"status": "healthy"}
 
