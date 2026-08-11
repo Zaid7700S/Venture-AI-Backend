@@ -10,3 +10,4 @@ duckduckgo-search
 tenacity
 python-dotenv
 slowapi
+ddgs
