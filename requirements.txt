@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+langchain-groq
+langchain-core
+langgraph
+pydantic
+pydantic-settings
+httpx
+duckduckgo-search
+tenacity
+python-dotenv
+slowapi
