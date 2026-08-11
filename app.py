@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
@@ -35,7 +36,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger(__name__)
 
 class Settings(BaseSettings):
-    groq_api_key: str = ""
     contact_email: str = "admin@example.com"
     osm_radius_m: int = 5000
     search_max_results: int = 3
@@ -48,12 +48,6 @@ class Settings(BaseSettings):
 
 load_dotenv()
 settings = Settings()
-
-if not settings.groq_api_key:
-    raise RuntimeError("GROQ_API_KEY is missing. Please add it to your .env file.")
-
-# Initialize LLM
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3)
 
 # ==========================================
 # UTILITIES & SCRAPERS (ASYNC)
@@ -243,9 +237,10 @@ class VentureState(TypedDict):
     wait=wait_exponential(min=2, max=10),
     reraise=True,
 )
-async def safe_structured_invoke(schema, prompt):
+async def safe_structured_invoke(schema, prompt, llm_instance):
+    """Wrapper for LLM structured invocation with Tenacity retries."""
     try:
-        return await llm.with_structured_output(schema).ainvoke([HumanMessage(content=prompt)])
+        return await llm_instance.with_structured_output(schema).ainvoke([HumanMessage(content=prompt)])
     except Exception as e:
         logger.error(f"LLM Structured Output Failed: {e}. Retrying...")
         raise
@@ -260,9 +255,10 @@ def safe_float(val: Any) -> float:
 # AGENT NODES (ASYNC & PARALLELIZED)
 # ==========================================
 
-async def supervisor_node(state: VentureState) -> Dict[str, Any]:
+async def supervisor_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     prompt = f"Deconstruct location string '{state['raw_location_input']}' for business '{state['business_idea']}'. Separate neighborhood from city/country."
-    res = await safe_structured_invoke(SupervisorSchema, prompt)
+    res = await safe_structured_invoke(SupervisorSchema, prompt, user_llm)
     data = res.model_dump()
     return {
         "neighborhood": data["neighborhood"],
@@ -271,17 +267,18 @@ async def supervisor_node(state: VentureState) -> Dict[str, Any]:
         "is_remote": data["is_remote"]
     }
 
-async def blueprint_agent_node(state: VentureState) -> Dict[str, Any]:
+async def blueprint_agent_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     prompt = f"""You are the Master Venture Architect. Create a master operational blueprint for a '{state['business_idea']}' in {state['neighborhood']}, {state['city_country']}.
     Classify the business_type as either 'Retail/Product' or 'Service/Experience'.
     Output 3 distinct budget tiers (Bootstrapped, Standard, Premium) with categorical equipment/role specifications.
     CRITICAL: All numeric fields must be valid numbers (ints or floats). Default capex to 0.0 if unknown."""
     
-    res = await safe_structured_invoke(MasterBlueprintSchema, prompt)
+    res = await safe_structured_invoke(MasterBlueprintSchema, prompt, user_llm)
     dumped = res.model_dump()
     return {"blueprint": dumped, "business_type": dumped["business_type"].value}
 
-async def financial_analyst_node(state: VentureState) -> Dict[str, Any]:
+async def financial_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     blueprint = state["blueprint"]
     budget = state["budget"]
     
@@ -315,7 +312,8 @@ async def financial_analyst_node(state: VentureState) -> Dict[str, Any]:
         "pivot_suggestion": pivot
     }
 
-async def market_pricing_node(state: VentureState) -> Dict[str, Any]:
+async def market_pricing_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     if state.get("business_type") == BusinessType.SERVICE.value:
         return {"market_rates": {"primary_material": "Service-Based (No Raw Materials)", "unit_price": 0.0, "unit_measurement": "N/A"}}
 
@@ -328,10 +326,11 @@ async def market_pricing_node(state: VentureState) -> Dict[str, Any]:
     CRITICAL: 'unit_price' MUST be a numeric float (e.g. 245000.0). Do NOT output explanatory text.
     Web Search Data: {search_data}"""
     
-    res = await safe_structured_invoke(MarketPricingSchema, prompt)
+    res = await safe_structured_invoke(MarketPricingSchema, prompt, user_llm)
     return {"market_rates": res.model_dump()}
 
-async def competitor_analyst_node(state: VentureState) -> Dict[str, Any]:
+async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     if state["is_remote"]:
         return {"competitors_data": []}
         
@@ -343,10 +342,11 @@ async def competitor_analyst_node(state: VentureState) -> Dict[str, Any]:
     search_data = await duckduckgo_search(query)
     
     prompt = f"Identify 3 competitors for {state['business_idea']} in {state['neighborhood']}, {state['city_country']}. Detail their market gaps. OSM: {osm}. Web: {search_data}"
-    res = await safe_structured_invoke(CompetitorSchema, prompt)
+    res = await safe_structured_invoke(CompetitorSchema, prompt, user_llm)
     return {"competitors_data": res.model_dump()["competitors"]}
 
-async def location_analyst_node(state: VentureState) -> Dict[str, Any]:
+async def location_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     if state["is_remote"]:
         return {"location_data": {"estimated_monthly_rent": 0.0, "notes": "Remote Digital Business."}}
         
@@ -357,20 +357,22 @@ async def location_analyst_node(state: VentureState) -> Dict[str, Any]:
     prompt = f"""Estimate monthly rent for a {sq_ft} sq ft space in {state['neighborhood']}, {state['city_country']} in {state['currency']}.
     CRITICAL: 'estimated_monthly_rent' MUST be a number. Data: {rent_data}"""
     
-    res = await safe_structured_invoke(LocationSchema, prompt)
+    res = await safe_structured_invoke(LocationSchema, prompt, user_llm)
     return {"location_data": res.model_dump()}
 
-async def legal_agent_node(state: VentureState) -> Dict[str, Any]:
+async def legal_agent_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     query = f"business registration permits required for {state['business_idea']} in {state['city_country']}"
     search_data = await duckduckgo_search(query)
     
     prompt = f"""Checklist of required local/national permits for {state['business_idea']} in {state['city_country']}.
     Ensure these are actual permits in {state['city_country']}. All cost fields MUST be valid numbers. Data: {search_data}"""
     
-    res = await safe_structured_invoke(LegalSchema, prompt)
+    res = await safe_structured_invoke(LegalSchema, prompt, user_llm)
     return {"legal_requirements": res.model_dump()["permits"]}
 
-async def workforce_analyst_node(state: VentureState) -> Dict[str, Any]:
+async def workforce_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     roles = ", ".join(state["selected_tier"].get("core_roles", []))
     query = f"average salary for {roles} in {state['city_country']} {state['currency']}"
     search_data = await duckduckgo_search(query)
@@ -382,7 +384,7 @@ async def workforce_analyst_node(state: VentureState) -> Dict[str, Any]:
     Do NOT output corporate enterprise-level salaries. Headcount and salary MUST be realistic valid numbers in {state['currency']}. 
     Data: {search_data}"""
     
-    res = await safe_structured_invoke(WorkforceSchema, prompt)
+    res = await safe_structured_invoke(WorkforceSchema, prompt, user_llm)
     work_data = res.model_dump()
     
     calculated_payroll = sum(safe_float(role.get('headcount', 0)) * safe_float(role.get('monthly_salary_per_person', 0)) for role in work_data.get('roles', []))
@@ -390,7 +392,8 @@ async def workforce_analyst_node(state: VentureState) -> Dict[str, Any]:
     
     return {"workforce_data": work_data}
 
-async def asset_equipment_node(state: VentureState) -> Dict[str, Any]:
+async def asset_equipment_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     tier = state["selected_tier"]
     categories = ", ".join(tier.get("key_equipment_categories", []))
     
@@ -404,7 +407,7 @@ async def asset_equipment_node(state: VentureState) -> Dict[str, Any]:
     Data: {search_data}
     """
     
-    res = await safe_structured_invoke(AssetSchema, prompt)
+    res = await safe_structured_invoke(AssetSchema, prompt, user_llm)
     asset_data = res.model_dump()
     
     calculated_total = sum(safe_float(item.get('cost', 0.0)) for item in asset_data.get('breakdown', []))
@@ -412,7 +415,8 @@ async def asset_equipment_node(state: VentureState) -> Dict[str, Any]:
     
     return {"asset_data": asset_data}
 
-async def product_strategist_node(state: VentureState) -> Dict[str, Any]:
+async def product_strategist_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     if state.get("business_type") == BusinessType.SERVICE.value:
         prompt_instruction = """The business is a Service/Experience. Create 4 Service Offerings (e.g. Hourly Passes, Monthly Memberships, VIP Sessions). 
         DO NOT try to sell the physical core equipment. COGS for services is usually low (electricity, maintenance)."""
@@ -424,19 +428,20 @@ async def product_strategist_node(state: VentureState) -> Dict[str, Any]:
     {prompt_instruction}
     CRITICAL: All prices and COGS fields MUST be valid numeric floats."""
     
-    res = await safe_structured_invoke(ProductSchema, prompt)
+    res = await safe_structured_invoke(ProductSchema, prompt, user_llm)
     return {"product_menu": res.model_dump()["products"]}
 
-async def marketing_agent_node(state: VentureState) -> Dict[str, Any]:
+async def marketing_agent_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    user_llm = config["configurable"]["llm"]
     prompt = f"""Growth strategy for '{state['business_idea']}' in {state['neighborhood']}, {state['city_country']}.
     1. Generate 3 highly creative, unique brand names.
     2. Target the specific demographic of {state['neighborhood']}. Provide 3 creative, real-world launch campaigns.
     Rule: NO high-tech AR/AI gimmicks if this is a physical store. Use real-world creative tactics."""
     
-    res = await safe_structured_invoke(MarketingSchema, prompt)
+    res = await safe_structured_invoke(MarketingSchema, prompt, user_llm)
     return {"marketing_plan": res.model_dump()}
 
-async def markdown_compiler_node(state: VentureState) -> Dict[str, Any]:
+async def markdown_compiler_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     tier = state.get("selected_tier", {})
     rent = safe_float(state.get("location_data", {}).get("estimated_monthly_rent"))
     payroll = safe_float(state.get("workforce_data", {}).get("total_monthly_payroll"))
@@ -590,10 +595,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def verify_api_key(x_api_key: str = Header(None)):
-    if x_api_key != settings.api_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key.")
-
 class PlanRequest(BaseModel):
     business_idea: str = Field(..., min_length=3, max_length=200)
     raw_location_input: str = Field(..., min_length=2)
@@ -603,15 +604,21 @@ class PlanRequest(BaseModel):
 async def get_homepage():
     return HTMLResponse(content=INDEX_HTML)
 
-@app.head("/health")
+@app.get("/health")
 async def health_check():
     return {"status": "healthy"}
-
-
 
 @app.post("/generate")
 @limiter.limit("5/minute")
 async def generate_plan(data: PlanRequest, request: Request):
+    # 1. Get the user's Groq API key from the frontend headers
+    user_groq_key = request.headers.get("X-Groq-API-Key")
+    if not user_groq_key:
+        raise HTTPException(status_code=401, detail="Groq API Key is missing. Please add it in the UI.")
+    
+    # 2. Dynamically initialize the LLM for THIS user
+    user_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3, groq_api_key=user_groq_key)
+    
     try:
         initial_input = {
             "business_idea": data.business_idea,
@@ -624,7 +631,11 @@ async def generate_plan(data: PlanRequest, request: Request):
             "is_feasible": False, "pivot_suggestion": "", "final_plan_markdown": "", "search_failed": False
         }
 
-        final_state = await venture_builder_app.ainvoke(initial_input)
+        # 3. Pass the user's LLM into the LangGraph config
+        final_state = await venture_builder_app.ainvoke(
+            initial_input, 
+            {"configurable": {"llm": user_llm}}
+        )
         
         safe_folder_name = "".join(c for c in final_state['business_idea'] if c.isascii() and (c.isalnum() or c in (' ', '_'))).strip() or "Business"
         base_dir = os.path.abspath("generated_plans")
@@ -665,7 +676,13 @@ class ChatRequest(BaseModel):
     chat_history: List[Dict[str, str]] = []
 
 @app.post("/chat")
-async def chat_with_plan(chat_data: ChatRequest):
+async def chat_with_plan(chat_data: ChatRequest, request: Request):
+    user_groq_key = request.headers.get("X-Groq-API-Key")
+    if not user_groq_key:
+        raise HTTPException(status_code=401, detail="Groq API Key is missing.")
+    
+    user_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3, groq_api_key=user_groq_key)
+    
     try:
         system_prompt = f"""You are an expert business analyst. The user has generated the following business plan:
         
@@ -683,7 +700,7 @@ async def chat_with_plan(chat_data: ChatRequest):
                 
         messages.append(HumanMessage(content=chat_data.user_message))
         
-        response = await llm.ainvoke(messages)
+        response = await user_llm.ainvoke(messages)
         return {"response": response.content}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
