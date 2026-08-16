@@ -19,6 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
+from groq import Groq as GroqClient
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 
@@ -70,10 +71,11 @@ def _ddg_search_sync(query: str, max_res: int) -> str:
         return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
 
 async def duckduckgo_search(query: str, max_results: int = None) -> tuple[str, bool]:
-    """Returns (result_text, failed). Cached for search_cache_ttl_s to reduce
-    load on DDG (which rate-limits aggressively) and speed up repeat queries."""
+    """Fallback search. Returns (result_text, failed). Cached to reduce load
+    on DDG, which rate-limits aggressively - this is now the fallback path
+    behind grounded_web_search(), not the primary source."""
     max_res = max_results or settings.search_max_results
-    cache_key = f"{query}::{max_res}"
+    cache_key = f"ddg::{query}::{max_res}"
 
     cached = _search_cache.get(cache_key)
     if cached and (time.monotonic() - cached[0]) < settings.search_cache_ttl_s:
@@ -86,6 +88,57 @@ async def duckduckgo_search(query: str, max_results: int = None) -> tuple[str, b
     except Exception as e:
         logger.error(f"DDG Search failed for query '{query}' after retries: {e}")
         return "Search unavailable.", True
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(min=1, max=4),
+    reraise=True,
+)
+def _groq_browser_search_sync(query: str, api_key: str) -> str:
+    """Uses Groq's native browser_search built-in tool (available on the
+    gpt-oss model family) to get a live, cited web answer. Runs on the
+    smaller/cheaper gpt-oss-20b since this is a fact-lookup step, not the
+    main reasoning - the structured-extraction step downstream still uses
+    the bigger model."""
+    client = GroqClient(api_key=api_key)
+    completion = client.chat.completions.create(
+        model="openai/gpt-oss-20b",
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Search the web and answer concisely with current, factual "
+                f"information: {query}. Include specific numbers/prices where "
+                f"available and note the source."
+            )
+        }],
+        tools=[{"type": "browser_search"}],
+        tool_choice="required",
+        max_completion_tokens=700,
+        temperature=0.2,
+    )
+    content = completion.choices[0].message.content
+    if not content or not content.strip():
+        raise ValueError("Empty response from Groq browser_search")
+    return content
+
+async def grounded_web_search(query: str, groq_api_key: str, max_results: int = None) -> tuple[str, bool]:
+    """Primary search path: Groq's live, cited browser_search tool. Falls
+    back to DuckDuckGo if the Groq call fails (missing key, rate limit,
+    tool error) so a single grounding failure doesn't take down plan
+    generation. Returns (result_text, failed) - failed is only True if
+    BOTH the primary and fallback path failed."""
+    cache_key = f"groq::{query}"
+    cached = _search_cache.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < settings.search_cache_ttl_s:
+        return cached[1], False
+
+    try:
+        text = await asyncio.to_thread(_groq_browser_search_sync, query, groq_api_key)
+        _search_cache[cache_key] = (time.monotonic(), text)
+        return text, False
+    except Exception as e:
+        logger.warning(f"Groq browser_search failed for query '{query}', falling back to DDG: {e}")
+        return await duckduckgo_search(query, max_results)
 
 async def geocode_location(query: str) -> Dict[str, Any]:
     if "remote" in query.lower() or "online" in query.lower():
@@ -346,13 +399,14 @@ async def financial_analyst_node(state: VentureState, config: RunnableConfig) ->
 
 async def market_pricing_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
+    groq_api_key = config["configurable"]["groq_api_key"]
     if state.get("business_type") == BusinessType.SERVICE.value:
         return {"market_rates": {"primary_material": "Service-Based (No Raw Materials)", "unit_price": 0.0, "unit_measurement": "N/A"}}
 
     material = state["blueprint"].get("primary_commodity_material", "Raw Material")
     current_year = datetime.now().year
     query = f"current wholesale rate of {material} in {state['city_country']} {state['currency']} {current_year}"
-    search_data, failed = await duckduckgo_search(query)
+    search_data, failed = await grounded_web_search(query, groq_api_key)
     
     prompt = f"""Extract the current rate for {material} in {state['currency']} from the web search data.
     CRITICAL: 'unit_price' MUST be a numeric float (e.g. 245000.0). Do NOT output explanatory text.
@@ -363,6 +417,7 @@ async def market_pricing_node(state: VentureState, config: RunnableConfig) -> Di
 
 async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
+    groq_api_key = config["configurable"]["groq_api_key"]
     if state["is_remote"]:
         return {"competitors_data": []}
         
@@ -371,7 +426,7 @@ async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -
     osm = await fetch_osm_competitors(coords["lat"], coords["lon"], biz_keyword)
     
     query = f"{state['business_idea']} in {state['neighborhood']}, {state['city_country']} reviews competitors"
-    search_data, failed = await duckduckgo_search(query)
+    search_data, failed = await grounded_web_search(query, groq_api_key)
     
     prompt = f"Identify 3 competitors for {state['business_idea']} in {state['neighborhood']}, {state['city_country']}. Detail their market gaps. OSM: {osm}. Web: {search_data}"
     res = await safe_structured_invoke(CompetitorSchema, prompt, user_llm)
@@ -379,11 +434,12 @@ async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -
 
 async def location_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
+    groq_api_key = config["configurable"]["groq_api_key"]
     if state["is_remote"]:
         return {"location_data": {"estimated_monthly_rent": 0.0, "notes": "Remote Digital Business."}}
         
     query = f"commercial shop rent per sq ft in {state['neighborhood']}, {state['city_country']}"
-    rent_data, failed = await duckduckgo_search(query)
+    rent_data, failed = await grounded_web_search(query, groq_api_key)
     
     sq_ft = state["selected_tier"].get("estimated_sq_ft", settings.default_sq_ft)
     prompt = f"""Estimate monthly rent for a {sq_ft} sq ft space in {state['neighborhood']}, {state['city_country']} in {state['currency']}.
@@ -394,8 +450,9 @@ async def location_analyst_node(state: VentureState, config: RunnableConfig) -> 
 
 async def legal_agent_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
+    groq_api_key = config["configurable"]["groq_api_key"]
     query = f"business registration permits required for {state['business_idea']} in {state['city_country']}"
-    search_data, failed = await duckduckgo_search(query)
+    search_data, failed = await grounded_web_search(query, groq_api_key)
     
     prompt = f"""Checklist of required local/national permits for {state['business_idea']} in {state['city_country']}.
     Ensure these are actual permits in {state['city_country']}. All cost fields MUST be valid numbers. Data: {search_data}"""
@@ -405,9 +462,10 @@ async def legal_agent_node(state: VentureState, config: RunnableConfig) -> Dict[
 
 async def workforce_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
+    groq_api_key = config["configurable"]["groq_api_key"]
     roles = ", ".join(state["selected_tier"].get("core_roles", []))
     query = f"average salary for {roles} in {state['city_country']} {state['currency']}"
-    search_data, failed = await duckduckgo_search(query)
+    search_data, failed = await grounded_web_search(query, groq_api_key)
     
     prompt = f"""Calculate realistic monthly payroll for the team ({roles}) running a {state['business_idea']} in {state['neighborhood']}, {state['city_country']}.
     
@@ -426,11 +484,12 @@ async def workforce_analyst_node(state: VentureState, config: RunnableConfig) ->
 
 async def asset_equipment_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
+    groq_api_key = config["configurable"]["groq_api_key"]
     tier = state["selected_tier"]
     categories = ", ".join(tier.get("key_equipment_categories", []))
     
     query = f"commercial setup price for {categories} in {state['city_country']} {state['currency']}"
-    search_data, failed = await duckduckgo_search(query)
+    search_data, failed = await grounded_web_search(query, groq_api_key)
     
     prompt = f"""Estimate pricing for the selected tier '{tier['tier_name']}' equipment ({categories}) for {state['business_idea']}.
     CRITICAL CURRENCY WARNING: The required currency is {state['currency']}. 
@@ -669,7 +728,7 @@ async def generate_plan(data: PlanRequest, request: Request):
         # 3. Pass the user's LLM into the LangGraph config
         final_state = await venture_builder_app.ainvoke(
             initial_input, 
-            {"configurable": {"llm": user_llm}}
+            {"configurable": {"llm": user_llm, "groq_api_key": user_groq_key}}
         )
         
         return JSONResponse(content={
