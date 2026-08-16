@@ -3,6 +3,8 @@ import logging
 import asyncio
 import copy
 import enum
+import operator
+import time
 from typing import List, Dict, Any, TypedDict, Optional, Annotated
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -10,9 +12,9 @@ from pathlib import Path
 
 import httpx
 from ddgs import DDGS
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ValidationError
 from pydantic_settings import BaseSettings
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_exception
 
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
@@ -41,6 +43,7 @@ class Settings(BaseSettings):
     search_max_results: int = 3
     default_sq_ft: int = 400
     utility_as_rent_pct: float = 0.3
+    search_cache_ttl_s: int = 21600  # 6 hours
 
     class Config:
         env_file = ".env"
@@ -52,19 +55,37 @@ settings = Settings()
 # UTILITIES & SCRAPERS (ASYNC)
 # ==========================================
 
-async def duckduckgo_search(query: str, max_results: int = None) -> str:
+_search_cache: Dict[str, tuple[float, str]] = {}
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(min=1, max=4),
+    reraise=True,
+)
+def _ddg_search_sync(query: str, max_res: int) -> str:
+    with DDGS() as ddgs:
+        results = list(ddgs.text(query, max_results=max_res))
+        if not results:
+            return "No results found."
+        return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+
+async def duckduckgo_search(query: str, max_results: int = None) -> tuple[str, bool]:
+    """Returns (result_text, failed). Cached for search_cache_ttl_s to reduce
+    load on DDG (which rate-limits aggressively) and speed up repeat queries."""
     max_res = max_results or settings.search_max_results
-    def _sync_search():
-        try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_res))
-                if not results:
-                    return "No results found."
-                return "\n".join([f"- {r['title']}: {r['body']}" for r in results])
-        except Exception as e:
-            logger.error(f"DDG Search failed for query '{query}': {e}")
-            return "Search unavailable."
-    return await asyncio.to_thread(_sync_search)
+    cache_key = f"{query}::{max_res}"
+
+    cached = _search_cache.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < settings.search_cache_ttl_s:
+        return cached[1], False
+
+    try:
+        text = await asyncio.to_thread(_ddg_search_sync, query, max_res)
+        _search_cache[cache_key] = (time.monotonic(), text)
+        return text, False
+    except Exception as e:
+        logger.error(f"DDG Search failed for query '{query}' after retries: {e}")
+        return "Search unavailable.", True
 
 async def geocode_location(query: str) -> Dict[str, Any]:
     if "remote" in query.lower() or "online" in query.lower():
@@ -225,23 +246,35 @@ class VentureState(TypedDict):
     is_feasible: bool
     pivot_suggestion: str
     final_plan_markdown: str
-    search_failed: bool
+    search_failed: Annotated[bool, operator.or_]
 
 # ==========================================
 # SAFE LLM INVOCATION WRAPPER
 # ==========================================
 
+def _is_retryable(exception: BaseException) -> bool:
+    """Don't burn retries on errors that will just fail the same way again -
+    a validation error means the model's output didn't match the schema,
+    which is a prompt/schema problem, not a transient one."""
+    return not isinstance(exception, ValidationError)
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=2, max=10),
+    retry=retry_if_exception(_is_retryable),
     reraise=True,
 )
 async def safe_structured_invoke(schema, prompt, llm_instance):
-    """Wrapper for LLM structured invocation with Tenacity retries."""
+    """Wrapper for LLM structured invocation with Tenacity retries.
+    Retries transient failures (network, rate limits, timeouts); fails fast
+    on schema validation errors since those won't fix themselves on retry."""
     try:
         return await llm_instance.with_structured_output(schema, method="json_schema").ainvoke([HumanMessage(content=prompt)])
     except Exception as e:
-        logger.error(f"LLM Structured Output Failed: {e}. Retrying...")
+        if isinstance(e, ValidationError):
+            logger.error(f"LLM Structured Output failed schema validation (not retrying): {e}")
+        else:
+            logger.error(f"LLM Structured Output Failed: {e}. Retrying...")
         raise
 
 def safe_float(val: Any) -> float:
@@ -300,7 +333,7 @@ async def financial_analyst_node(state: VentureState, config: RunnableConfig) ->
         selected = boot
         
     is_feasible = budget >= selected["estimated_startup_capex"]
-    pivot = "" if is_feasible else f"Budget ({budget:,.0f} {state['currency']}) is below the minimum Bootstrapped setup ({boot['estimated_startup_capex']:,.0f} {state['currency']})."
+    pivot = "" if is_feasible else f"Budget ({budget:,.0f} {state['currency']}) is below the minimum '{boot.get('tier_name', 'Bootstrapped')}' setup ({boot['estimated_startup_capex']:,.0f} {state['currency']})."
     
     selected_copy = copy.deepcopy(selected)
     
@@ -319,14 +352,14 @@ async def market_pricing_node(state: VentureState, config: RunnableConfig) -> Di
     material = state["blueprint"].get("primary_commodity_material", "Raw Material")
     current_year = datetime.now().year
     query = f"current wholesale rate of {material} in {state['city_country']} {state['currency']} {current_year}"
-    search_data = await duckduckgo_search(query)
+    search_data, failed = await duckduckgo_search(query)
     
     prompt = f"""Extract the current rate for {material} in {state['currency']} from the web search data.
     CRITICAL: 'unit_price' MUST be a numeric float (e.g. 245000.0). Do NOT output explanatory text.
     Web Search Data: {search_data}"""
     
     res = await safe_structured_invoke(MarketPricingSchema, prompt, user_llm)
-    return {"market_rates": res.model_dump()}
+    return {"market_rates": res.model_dump(), "search_failed": failed}
 
 async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
@@ -338,11 +371,11 @@ async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -
     osm = await fetch_osm_competitors(coords["lat"], coords["lon"], biz_keyword)
     
     query = f"{state['business_idea']} in {state['neighborhood']}, {state['city_country']} reviews competitors"
-    search_data = await duckduckgo_search(query)
+    search_data, failed = await duckduckgo_search(query)
     
     prompt = f"Identify 3 competitors for {state['business_idea']} in {state['neighborhood']}, {state['city_country']}. Detail their market gaps. OSM: {osm}. Web: {search_data}"
     res = await safe_structured_invoke(CompetitorSchema, prompt, user_llm)
-    return {"competitors_data": res.model_dump()["competitors"]}
+    return {"competitors_data": res.model_dump()["competitors"], "search_failed": failed}
 
 async def location_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
@@ -350,31 +383,31 @@ async def location_analyst_node(state: VentureState, config: RunnableConfig) -> 
         return {"location_data": {"estimated_monthly_rent": 0.0, "notes": "Remote Digital Business."}}
         
     query = f"commercial shop rent per sq ft in {state['neighborhood']}, {state['city_country']}"
-    rent_data = await duckduckgo_search(query)
+    rent_data, failed = await duckduckgo_search(query)
     
     sq_ft = state["selected_tier"].get("estimated_sq_ft", settings.default_sq_ft)
     prompt = f"""Estimate monthly rent for a {sq_ft} sq ft space in {state['neighborhood']}, {state['city_country']} in {state['currency']}.
     CRITICAL: 'estimated_monthly_rent' MUST be a number. Data: {rent_data}"""
     
     res = await safe_structured_invoke(LocationSchema, prompt, user_llm)
-    return {"location_data": res.model_dump()}
+    return {"location_data": res.model_dump(), "search_failed": failed}
 
 async def legal_agent_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
     query = f"business registration permits required for {state['business_idea']} in {state['city_country']}"
-    search_data = await duckduckgo_search(query)
+    search_data, failed = await duckduckgo_search(query)
     
     prompt = f"""Checklist of required local/national permits for {state['business_idea']} in {state['city_country']}.
     Ensure these are actual permits in {state['city_country']}. All cost fields MUST be valid numbers. Data: {search_data}"""
     
     res = await safe_structured_invoke(LegalSchema, prompt, user_llm)
-    return {"legal_requirements": res.model_dump()["permits"]}
+    return {"legal_requirements": res.model_dump()["permits"], "search_failed": failed}
 
 async def workforce_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
     roles = ", ".join(state["selected_tier"].get("core_roles", []))
     query = f"average salary for {roles} in {state['city_country']} {state['currency']}"
-    search_data = await duckduckgo_search(query)
+    search_data, failed = await duckduckgo_search(query)
     
     prompt = f"""Calculate realistic monthly payroll for the team ({roles}) running a {state['business_idea']} in {state['neighborhood']}, {state['city_country']}.
     
@@ -389,7 +422,7 @@ async def workforce_analyst_node(state: VentureState, config: RunnableConfig) ->
     calculated_payroll = sum(safe_float(role.get('headcount', 0)) * safe_float(role.get('monthly_salary_per_person', 0)) for role in work_data.get('roles', []))
     work_data['total_monthly_payroll'] = calculated_payroll
     
-    return {"workforce_data": work_data}
+    return {"workforce_data": work_data, "search_failed": failed}
 
 async def asset_equipment_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
@@ -397,7 +430,7 @@ async def asset_equipment_node(state: VentureState, config: RunnableConfig) -> D
     categories = ", ".join(tier.get("key_equipment_categories", []))
     
     query = f"commercial setup price for {categories} in {state['city_country']} {state['currency']}"
-    search_data = await duckduckgo_search(query)
+    search_data, failed = await duckduckgo_search(query)
     
     prompt = f"""Estimate pricing for the selected tier '{tier['tier_name']}' equipment ({categories}) for {state['business_idea']}.
     CRITICAL CURRENCY WARNING: The required currency is {state['currency']}. 
@@ -412,7 +445,7 @@ async def asset_equipment_node(state: VentureState, config: RunnableConfig) -> D
     calculated_total = sum(safe_float(item.get('cost', 0.0)) for item in asset_data.get('breakdown', []))
     asset_data['total_asset_cost'] = calculated_total
     
-    return {"asset_data": asset_data}
+    return {"asset_data": asset_data, "search_failed": failed}
 
 async def product_strategist_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
@@ -463,7 +496,7 @@ async def markdown_compiler_node(state: VentureState, config: RunnableConfig) ->
 * **City & Region:** {state['city_country']}
 * **Available User Budget:** {state['budget']:,.0f} {state['currency']}
 * **Feasibility Status:** {'✅ **FEASIBLE**' if state['is_feasible'] else '⚠️ **INSUFFICIENT BUDGET**'}
-
+{"\n> ⚠️ **Data Notice:** One or more live web lookups (pricing, rent, salary, or permit data) were unavailable while generating this plan. Some figures below may rely more heavily on the AI's general estimate rather than current local data — treat them as a starting point and verify independently.\n" if state.get('search_failed') else ""}
 ---
 
 ## 🏬 Real Estate & Neighborhood Dynamics ({state['neighborhood']})
@@ -639,29 +672,8 @@ async def generate_plan(data: PlanRequest, request: Request):
             {"configurable": {"llm": user_llm}}
         )
         
-        safe_folder_name = "".join(c for c in final_state['business_idea'] if c.isascii() and (c.isalnum() or c in (' ', '_'))).strip() or "Business"
-        base_dir = os.path.abspath("generated_plans")
-        folder_path = os.path.abspath(os.path.join(base_dir, safe_folder_name))
-        
-        if not folder_path.startswith(base_dir):
-            raise ValueError("Invalid path")
-            
-        os.makedirs(folder_path, exist_ok=True)
-        
-        version = 1
-        while True:
-            file_name = f"BusinessPlan_v{version}.md"
-            file_path = os.path.join(folder_path, file_name)
-            try:
-                with open(file_path, "x", encoding="utf-8") as file:
-                    file.write(final_state["final_plan_markdown"])
-                break
-            except FileExistsError:
-                version += 1
-        
         return JSONResponse(content={
-            "markdown": final_state["final_plan_markdown"],
-            "saved_file_path": file_path
+            "markdown": final_state["final_plan_markdown"]
         })
     
     except Exception as e:
@@ -678,6 +690,7 @@ class ChatRequest(BaseModel):
     chat_history: List[Dict[str, str]] = []
 
 @app.post("/chat")
+@limiter.limit("15/minute")
 async def chat_with_plan(chat_data: ChatRequest, request: Request):
     user_groq_key = request.headers.get("X-Groq-API-Key")
     if not user_groq_key:
