@@ -41,7 +41,6 @@ class Settings(BaseSettings):
     search_max_results: int = 3
     default_sq_ft: int = 400
     utility_as_rent_pct: float = 0.3
-    api_key: str = "secret-key-change-me" # Default API key for auth
 
     class Config:
         env_file = ".env"
@@ -240,7 +239,7 @@ class VentureState(TypedDict):
 async def safe_structured_invoke(schema, prompt, llm_instance):
     """Wrapper for LLM structured invocation with Tenacity retries."""
     try:
-        return await llm_instance.with_structured_output(schema).ainvoke([HumanMessage(content=prompt)])
+        return await llm_instance.with_structured_output(schema, method="json_schema").ainvoke([HumanMessage(content=prompt)])
     except Exception as e:
         logger.error(f"LLM Structured Output Failed: {e}. Retrying...")
         raise
@@ -617,7 +616,7 @@ async def generate_plan(data: PlanRequest, request: Request):
         raise HTTPException(status_code=401, detail="Groq API Key is missing. Please add it in the UI.")
     
     # 2. Dynamically initialize the LLM for THIS user
-    user_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3, groq_api_key=user_groq_key)
+    user_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, groq_api_key=user_groq_key)
     
     try:
         initial_input = {
@@ -681,7 +680,7 @@ async def chat_with_plan(chat_data: ChatRequest, request: Request):
     if not user_groq_key:
         raise HTTPException(status_code=401, detail="Groq API Key is missing.")
     
-    user_llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.3, groq_api_key=user_groq_key)
+    user_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, groq_api_key=user_groq_key)
     
     try:
         system_prompt = f"""You are an expert business analyst. The user has generated the following business plan:
