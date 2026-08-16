@@ -19,7 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
-from groq import Groq as GroqClient
+from groq import Groq as GroqClient, RateLimitError as GroqRateLimitError
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 
@@ -89,9 +89,18 @@ async def duckduckgo_search(query: str, max_results: int = None) -> tuple[str, b
         logger.error(f"DDG Search failed for query '{query}' after retries: {e}")
         return "Search unavailable.", True
 
+_groq_search_cooldown_until: float = 0.0  # monotonic timestamp
+
+def _not_rate_limited(exception: BaseException) -> bool:
+    """A 429 (esp. daily token quota) won't be fixed by retrying in a few
+    seconds - retrying just adds latency and log noise. Only retry other
+    transient errors (timeouts, connection resets)."""
+    return not isinstance(exception, GroqRateLimitError)
+
 @retry(
     stop=stop_after_attempt(2),
     wait=wait_exponential(min=1, max=4),
+    retry=retry_if_exception(_not_rate_limited),
     reraise=True,
 )
 def _groq_browser_search_sync(query: str, api_key: str) -> str:
@@ -126,16 +135,29 @@ async def grounded_web_search(query: str, groq_api_key: str, max_results: int = 
     back to DuckDuckGo if the Groq call fails (missing key, rate limit,
     tool error) so a single grounding failure doesn't take down plan
     generation. Returns (result_text, failed) - failed is only True if
-    BOTH the primary and fallback path failed."""
+    BOTH the primary and fallback path failed.
+
+    Once a rate limit is hit, further Groq calls in the same window are
+    skipped entirely (straight to DDG) rather than retried and failed
+    individually - a daily quota exhaustion doesn't clear in seconds, so
+    hitting it 6 more times in the same plan generation just wastes time."""
+    global _groq_search_cooldown_until
     cache_key = f"groq::{query}"
     cached = _search_cache.get(cache_key)
     if cached and (time.monotonic() - cached[0]) < settings.search_cache_ttl_s:
         return cached[1], False
 
+    if time.monotonic() < _groq_search_cooldown_until:
+        return await duckduckgo_search(query, max_results)
+
     try:
         text = await asyncio.to_thread(_groq_browser_search_sync, query, groq_api_key)
         _search_cache[cache_key] = (time.monotonic(), text)
         return text, False
+    except GroqRateLimitError as e:
+        logger.warning(f"Groq browser_search rate-limited, pausing Groq search for 3 minutes and falling back to DDG: {e}")
+        _groq_search_cooldown_until = time.monotonic() + 180  # 3 min cooldown
+        return await duckduckgo_search(query, max_results)
     except Exception as e:
         logger.warning(f"Groq browser_search failed for query '{query}', falling back to DDG: {e}")
         return await duckduckgo_search(query, max_results)
@@ -157,31 +179,42 @@ async def geocode_location(query: str) -> Dict[str, Any]:
         logger.error(f"Geocoding Error for '{query}': {e}")
     return {"lat": 0.0, "lon": 0.0, "display_name": query}
 
-async def fetch_osm_competitors(lat: float, lon: float, biz_keyword: str, radius: int = None) -> List[Dict[str, Any]]:
+async def fetch_osm_competitors(lat: float, lon: float, biz_keyword: str, radius: int = None) -> tuple[List[Dict[str, Any]], bool]:
     if lat == 0.0 and lon == 0.0:
-        return []
+        return [], False
     
     rad = radius or settings.osm_radius_m
-    overpass_url = "https://overpass-api.de/api/interpreter"
+    # The main overpass-api.de endpoint is a shared public instance that
+    # frequently drops connections under load. Try mirrors in order instead
+    # of giving up after the first failure.
+    overpass_urls = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+    ]
     query = f'[out:json];(node(around:{rad},{lat},{lon})["shop"~"{biz_keyword}",i];node(around:{rad},{lat},{lon})["amenity"~"{biz_keyword}",i];node(around:{rad},{lat},{lon})["leisure"~"{biz_keyword}",i];);out body 10;'
     headers = {'User-Agent': f'AIVentureBuilder/6.0 (business_planner)'} 
     
-    try:
-        async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
-            res = await client.get(overpass_url, params={'data': query})
-            res.raise_for_status()
-            data = res.json()
-            
-            competitors = []
-            for elem in data.get('elements', []):
-                tags = elem.get('tags', {})
-                if "name" in tags:
-                    biz_type = tags.get("shop") or tags.get("amenity") or tags.get("leisure") or "business"
-                    competitors.append({"name": tags.get("name"), "type": biz_type})
-            return competitors
-    except Exception as e:
-        logger.error(f"OSM API Error: {e}")
-        return []
+    for overpass_url in overpass_urls:
+        try:
+            async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+                res = await client.get(overpass_url, params={'data': query})
+                res.raise_for_status()
+                data = res.json()
+                
+                competitors = []
+                for elem in data.get('elements', []):
+                    tags = elem.get('tags', {})
+                    if "name" in tags:
+                        biz_type = tags.get("shop") or tags.get("amenity") or tags.get("leisure") or "business"
+                        competitors.append({"name": tags.get("name"), "type": biz_type})
+                return competitors, False
+        except Exception as e:
+            logger.warning(f"OSM API Error via {overpass_url}: {e}")
+            continue
+    
+    logger.error("OSM API Error: all Overpass mirrors failed")
+    return [], True
 
 # ==========================================
 # PYDANTIC STRUCTURED SCHEMAS & ENUMS
@@ -423,14 +456,14 @@ async def competitor_analyst_node(state: VentureState, config: RunnableConfig) -
         
     biz_keyword = state['business_idea'].split()[0].lower()
     coords = await geocode_location(f"{state['neighborhood']}, {state['city_country']}")
-    osm = await fetch_osm_competitors(coords["lat"], coords["lon"], biz_keyword)
+    osm, osm_failed = await fetch_osm_competitors(coords["lat"], coords["lon"], biz_keyword)
     
     query = f"{state['business_idea']} in {state['neighborhood']}, {state['city_country']} reviews competitors"
-    search_data, failed = await grounded_web_search(query, groq_api_key)
+    search_data, web_failed = await grounded_web_search(query, groq_api_key)
     
     prompt = f"Identify 3 competitors for {state['business_idea']} in {state['neighborhood']}, {state['city_country']}. Detail their market gaps. OSM: {osm}. Web: {search_data}"
     res = await safe_structured_invoke(CompetitorSchema, prompt, user_llm)
-    return {"competitors_data": res.model_dump()["competitors"], "search_failed": failed}
+    return {"competitors_data": res.model_dump()["competitors"], "search_failed": osm_failed or web_failed}
 
 async def location_analyst_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
@@ -545,6 +578,20 @@ async def markdown_compiler_node(state: VentureState, config: RunnableConfig) ->
     total_asset_cost = safe_float(state.get('asset_data', {}).get('total_asset_cost'))
     estimated_startup_capex = safe_float(tier.get("estimated_startup_capex"))
 
+    # The blueprint's estimated_startup_capex (above) is the LLM's rough guess
+    # made BEFORE any real research ran. is_feasible was locked in against that
+    # guess back in financial_analyst_node, before asset/legal costs were known.
+    # Recompute against the actual researched numbers now that they exist, so
+    # the feasibility verdict reflects reality instead of a pre-research guess.
+    total_legal_fees = sum(
+        safe_float(p.get('estimated_cost', 0.0))
+        for p in state.get('legal_requirements', [])
+    )
+    researched_total_capex = total_asset_cost + total_legal_fees
+    budget = state['budget']
+    is_feasible_actual = budget >= researched_total_capex
+    capex_gap = researched_total_capex - budget
+
     plan = f"""# 🚀 Detailed Business Plan & Feasibility Study
 
 ## 📌 Executive Summary
@@ -554,7 +601,7 @@ async def markdown_compiler_node(state: VentureState, config: RunnableConfig) ->
 * **Target Neighborhood:** {state['neighborhood']}
 * **City & Region:** {state['city_country']}
 * **Available User Budget:** {state['budget']:,.0f} {state['currency']}
-* **Feasibility Status:** {'✅ **FEASIBLE**' if state['is_feasible'] else '⚠️ **INSUFFICIENT BUDGET**'}
+* **Feasibility Status:** {'✅ **FEASIBLE**' if is_feasible_actual else '⚠️ **INSUFFICIENT BUDGET**'}
 {"\n> ⚠️ **Data Notice:** One or more live web lookups (pricing, rent, salary, or permit data) were unavailable while generating this plan. Some figures below may rely more heavily on the AI's general estimate rather than current local data — treat them as a starting point and verify independently.\n" if state.get('search_failed') else ""}
 ---
 
@@ -591,11 +638,12 @@ async def markdown_compiler_node(state: VentureState, config: RunnableConfig) ->
         plan += f"- **{role.get('title')}** (x{role.get('headcount')}): {salary:,.0f} {state['currency']}/month\n"
 
     plan += f"\n--- \n## 💰 Master Financial Overview\n"
-    plan += f"* **Total Startup CAPEX:** {estimated_startup_capex:,.0f} {state['currency']}\n"
+    plan += f"* **Initial AI Estimate (pre-research):** {estimated_startup_capex:,.0f} {state['currency']}\n"
+    plan += f"* **Researched Total Startup CAPEX:** **{researched_total_capex:,.0f} {state['currency']}** *(Equipment/Inventory + Legal & Permit Fees, based on live research)*\n"
     plan += f"* **Estimated Monthly OPEX:** {opex:,.0f} {state['currency']}/month *(Rent + Payroll + Utilities)*\n\n"
     
-    if not state['is_feasible']:
-        plan += f"> ⚠️ **Budget Warning:** {state.get('pivot_suggestion')}\n\n"
+    if not is_feasible_actual:
+        plan += f"> ⚠️ **Budget Warning:** Your budget ({budget:,.0f} {state['currency']}) is {capex_gap:,.0f} {state['currency']} short of the researched startup cost ({researched_total_capex:,.0f} {state['currency']}) for the '{tier.get('tier_name', 'selected')}' tier. Consider a lower tier, a smaller footprint, or phasing your launch. {state.get('pivot_suggestion', '')}\n\n"
 
     plan += f"\n--- \n## 💎 Signature Offerings & Pricing\n"
     for item in state.get('product_menu', []):
