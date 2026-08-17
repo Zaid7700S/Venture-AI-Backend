@@ -333,6 +333,7 @@ class VentureState(TypedDict):
     pivot_suggestion: str
     final_plan_markdown: str
     search_failed: Annotated[bool, operator.or_]
+    tier_rank: int
 
 # ==========================================
 # SAFE LLM INVOCATION WRAPPER
@@ -412,11 +413,11 @@ async def financial_analyst_node(state: VentureState, config: RunnableConfig) ->
     boot, std, prem = tiers[0], tiers[1], tiers[2]
     
     if budget >= prem["estimated_startup_capex"]:
-        selected = prem
+        selected, rank = prem, 2
     elif budget >= std["estimated_startup_capex"]:
-        selected = std
+        selected, rank = std, 1
     else:
-        selected = boot
+        selected, rank = boot, 0
         
     is_feasible = budget >= selected["estimated_startup_capex"]
     pivot = "" if is_feasible else f"Budget ({budget:,.0f} {state['currency']}) is below the minimum '{boot.get('tier_name', 'Bootstrapped')}' setup ({boot['estimated_startup_capex']:,.0f} {state['currency']})."
@@ -427,8 +428,41 @@ async def financial_analyst_node(state: VentureState, config: RunnableConfig) ->
         "selected_tier": selected_copy,
         "financial_model": {"capex": selected_copy["estimated_startup_capex"], "status": "PASS" if is_feasible else "FAIL"},
         "is_feasible": is_feasible,
-        "pivot_suggestion": pivot
+        "pivot_suggestion": pivot,
+        "tier_rank": rank
     }
+
+def budget_gate_router(state: VentureState) -> str:
+    """Runs after asset_equipment (the fan-in join point, where real
+    researched equipment + legal costs are both known). If the actual
+    researched total blows the budget and a cheaper tier still exists,
+    downgrade and re-research instead of shipping a plan built around
+    a tier the budget can never actually support."""
+    total_asset_cost = safe_float(state.get('asset_data', {}).get('total_asset_cost'))
+    total_legal_fees = sum(
+        safe_float(p.get('estimated_cost', 0.0))
+        for p in state.get('legal_requirements', [])
+    )
+    researched_total_capex = total_asset_cost + total_legal_fees
+    if researched_total_capex > state['budget'] and state.get("tier_rank", 0) > 0:
+        return "downgrade"
+    return "proceed"
+
+async def downgrade_tier_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
+    blueprint = state["blueprint"]
+    tiers = sorted([
+        blueprint["bootstrapped_tier"],
+        blueprint["standard_tier"],
+        blueprint["premium_tier"]
+    ], key=lambda t: safe_float(t.get("estimated_startup_capex", 0.0)))
+    
+    new_rank = max(0, state.get("tier_rank", 0) - 1)
+    new_tier = copy.deepcopy(tiers[new_rank])
+    logger.info(
+        f"Budget gate: researched costs exceeded budget, downgrading to "
+        f"'{new_tier.get('tier_name', 'tier')}' (rank {new_rank})."
+    )
+    return {"selected_tier": new_tier, "tier_rank": new_rank}
 
 async def market_pricing_node(state: VentureState, config: RunnableConfig) -> Dict[str, Any]:
     user_llm = config["configurable"]["llm"]
@@ -698,13 +732,24 @@ builder.add_edge("financial_analyst", "location_analyst")
 builder.add_edge("financial_analyst", "legal_agent")
 builder.add_edge("financial_analyst", "workforce_analyst")
 
+builder.add_node("downgrade_tier", downgrade_tier_node)
+builder.add_edge("downgrade_tier", "market_pricing")
+builder.add_edge("downgrade_tier", "competitor_analyst")
+builder.add_edge("downgrade_tier", "location_analyst")
+builder.add_edge("downgrade_tier", "legal_agent")
+builder.add_edge("downgrade_tier", "workforce_analyst")
+
 builder.add_edge("market_pricing", "asset_equipment")
 builder.add_edge("competitor_analyst", "asset_equipment")
 builder.add_edge("location_analyst", "asset_equipment")
 builder.add_edge("legal_agent", "asset_equipment")
 builder.add_edge("workforce_analyst", "asset_equipment")
 
-builder.add_edge("asset_equipment", "product_strategist")
+builder.add_conditional_edges(
+    "asset_equipment",
+    budget_gate_router,
+    {"downgrade": "downgrade_tier", "proceed": "product_strategist"}
+)
 builder.add_edge("product_strategist", "marketing_agent")
 builder.add_edge("marketing_agent", "compiler")
 builder.add_edge("compiler", END)
@@ -770,7 +815,8 @@ async def generate_plan(data: PlanRequest, request: Request):
             "business_type": "", "blueprint": {}, "selected_tier": {}, "competitors_data": [], 
             "location_data": {}, "market_rates": {}, "asset_data": {}, "legal_requirements": [], 
             "workforce_data": {}, "product_menu": [], "financial_model": {}, "marketing_plan": {}, 
-            "is_feasible": False, "pivot_suggestion": "", "final_plan_markdown": "", "search_failed": False
+            "is_feasible": False, "pivot_suggestion": "", "final_plan_markdown": "", "search_failed": False,
+            "tier_rank": 0
         }
 
         # 3. Pass the user's LLM into the LangGraph config
