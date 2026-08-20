@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import asyncio
 import copy
@@ -25,7 +26,7 @@ from dotenv import load_dotenv
 
 # FastAPI imports
 from fastapi import FastAPI, HTTPException, Header, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -792,8 +793,22 @@ async def get_homepage():
     return HTMLResponse(content=INDEX_HTML)
 
 @app.head("/health")
+@app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+def _build_initial_state(data: PlanRequest) -> Dict[str, Any]:
+    return {
+        "business_idea": data.business_idea,
+        "raw_location_input": data.raw_location_input,
+        "budget": data.budget,
+        "neighborhood": "", "city_country": "", "currency": "USD", "is_remote": False,
+        "business_type": "", "blueprint": {}, "selected_tier": {}, "competitors_data": [],
+        "location_data": {}, "market_rates": {}, "asset_data": {}, "legal_requirements": [],
+        "workforce_data": {}, "product_menu": [], "financial_model": {}, "marketing_plan": {},
+        "is_feasible": False, "pivot_suggestion": "", "final_plan_markdown": "", "search_failed": False,
+        "tier_rank": 0
+    }
 
 @app.post("/generate")
 @limiter.limit("5/minute")
@@ -807,17 +822,7 @@ async def generate_plan(data: PlanRequest, request: Request):
     user_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, groq_api_key=user_groq_key)
     
     try:
-        initial_input = {
-            "business_idea": data.business_idea,
-            "raw_location_input": data.raw_location_input,
-            "budget": data.budget,
-            "neighborhood": "", "city_country": "", "currency": "USD", "is_remote": False,
-            "business_type": "", "blueprint": {}, "selected_tier": {}, "competitors_data": [], 
-            "location_data": {}, "market_rates": {}, "asset_data": {}, "legal_requirements": [], 
-            "workforce_data": {}, "product_menu": [], "financial_model": {}, "marketing_plan": {}, 
-            "is_feasible": False, "pivot_suggestion": "", "final_plan_markdown": "", "search_failed": False,
-            "tier_rank": 0
-        }
+        initial_input = _build_initial_state(data)
 
         # 3. Pass the user's LLM into the LangGraph config
         final_state = await venture_builder_app.ainvoke(
@@ -832,6 +837,64 @@ async def generate_plan(data: PlanRequest, request: Request):
     except Exception as e:
         logger.exception(f"Server Error generating plan: {e}")
         return JSONResponse(content={"error": "An internal server error occurred while generating the plan."}, status_code=500)
+
+
+# ==========================================
+# STREAMING GENERATE ENDPOINT (real agent progress)
+# ==========================================
+# Emits one Server-Sent Event per graph node as it actually finishes, so the
+# frontend's progress UI reflects real execution instead of a fixed timer.
+# Event shapes (all JSON, one per "data:" line):
+#   {"type": "node_done", "node": "<node_name>"}   - a node just finished
+#   {"type": "final", "markdown": "<plan md>"}      - the compiled plan
+#   {"type": "error", "message": "<human message>"} - something failed
+
+async def _stream_plan_events(initial_input: Dict[str, Any], user_llm, user_groq_key: str):
+    final_markdown = None
+    try:
+        async for step in venture_builder_app.astream(
+            initial_input,
+            {"configurable": {"llm": user_llm, "groq_api_key": user_groq_key}},
+            stream_mode="updates",
+        ):
+            # `step` looks like {"<node_name>": {...state patch...}}
+            for node_name, node_output in step.items():
+                yield f"data: {json.dumps({'type': 'node_done', 'node': node_name})}\n\n"
+                if node_name == "compiler" and isinstance(node_output, dict):
+                    final_markdown = node_output.get("final_plan_markdown")
+
+        if final_markdown:
+            yield f"data: {json.dumps({'type': 'final', 'markdown': final_markdown})}\n\n"
+        else:
+            logger.error("Stream completed without a compiler output.")
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Plan generation finished without producing a final plan.'})}\n\n"
+
+    except Exception as e:
+        logger.exception(f"Server Error generating plan (stream): {e}")
+        yield f"data: {json.dumps({'type': 'error', 'message': 'An internal server error occurred while generating the plan.'})}\n\n"
+
+
+@app.post("/generate/stream")
+@limiter.limit("5/minute")
+async def generate_plan_stream(data: PlanRequest, request: Request):
+    user_groq_key = request.headers.get("X-Groq-API-Key")
+    if not user_groq_key:
+        raise HTTPException(status_code=401, detail="Groq API Key is missing. Please add it in the UI.")
+
+    user_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, groq_api_key=user_groq_key)
+    initial_input = _build_initial_state(data)
+
+    return StreamingResponse(
+        _stream_plan_events(initial_input, user_llm, user_groq_key),
+        media_type="text/event-stream",
+        headers={
+            # Prevent proxies (nginx, Render's edge, etc.) from buffering the
+            # stream and delivering it all at once at the end.
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 # ==========================================
 # CHAT ENDPOINT
